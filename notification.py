@@ -2,9 +2,7 @@ from dataclasses import dataclass, field
 from itertools import chain
 from typing import Optional
 
-from talon import Context, Module, actions, app, cron, imgui, settings, ui
-
-# XXX(nriley) actions are being returned out of order; that's a problem if we want to pop up a menu
+from talon import Context, Module, actions, app, imgui, settings, speech_system, ui
 
 mod = Module()
 
@@ -53,10 +51,6 @@ class Actions:
     def notification_show_actions(index: int):
         """Display actions available on the notification at the specified index, or hide list if index is -1"""
 
-    def notifications_update():
-        """Update notification list to reflect what is currently onscreen"""
-        # (poll? not try to keep up? not sure what else to do)
-
     def notification_center():
         """Display or hide Notification Center"""
 
@@ -74,8 +68,8 @@ class Notification:
     actions: dict[str, str] = field(default=None, compare=False)
 
     @staticmethod
-    def group_identifier(group):
-        identifier = getattr(group, "AXIdentifier", None)
+    def identifier(notification):
+        identifier = getattr(notification, "AXIdentifier", None)
 
         if identifier is None or not str.isdigit(identifier):
             return None
@@ -83,58 +77,45 @@ class Notification:
         return int(identifier)
 
     @staticmethod
-    def from_group(group, identifier):
+    def from_button(button, identifier):
         # XXX(nriley) better handle AXNotificationCenterBannerStack
-        group_actions = group.actions
-        if "AXScrollToVisible" in group_actions:
-            del group_actions["AXScrollToVisible"]  # not useful
+        button_actions = button.actions
+        if "AXScrollToVisible" in button_actions:
+            del button_actions["AXScrollToVisible"]  # not useful
         # XXX(nriley) create_spoken_forms_from_list doesn't handle apostrophes correctly
-        # https://github.com/knausj85/knausj_talon/issues/780
-        group_actions = {
+        # https://github.com/talonhub/community/issues/780
+        button_actions = {
             name.lower().replace("’", "'"): action
-            for action, name in group_actions.items()
+            for action, name in button_actions.items()
         }
 
         title = body = subtitle = None
 
         try:
-            title = group.children.find_one(AXIdentifier="title").AXValue
+            title = button.children.find_one(AXIdentifier="title").AXValue
         except ui.UIErr:
             pass
 
         try:
-            body = group.children.find_one(AXIdentifier="body").AXValue
+            body = button.children.find_one(AXIdentifier="body").AXValue
         except ui.UIErr:
             pass
 
         try:
-            subtitle = group.children.find_one(AXIdentifier="subtitle").AXValue
+            subtitle = button.children.find_one(AXIdentifier="subtitle").AXValue
         except ui.UIErr:
             pass
 
         return Notification(
             identifier=identifier,
-            subrole=group.AXSubrole,
-            app_name=group.AXDescription,
-            stacking_identifier=group.AXStackingIdentifier,
+            subrole=button.AXSubrole,
+            app_name=button.AXDescription,
+            stacking_identifier=button.AXStackingIdentifier,
             title=title,
             subtitle=subtitle,
             body=body,
-            actions=group_actions,
+            actions=button_actions,
         )
-
-    @staticmethod
-    def notifications_in_window(window):
-        notifications = []
-
-        for group in window.children.find(AXRole="AXGroup"):
-            if not (identifier := Notification.group_identifier(group)):
-                continue
-
-            notification = Notification.from_group(group, identifier)
-            notifications.append(notification)
-
-        return notifications
 
 
 MONITOR = None
@@ -144,8 +125,15 @@ ctx.matches = r"""
 os: mac
 """
 
-ctx.lists["user.notification_actions"] = {}
-ctx.lists["user.notification_apps"] = {}
+
+@ctx.dynamic_list("user.notification_actions")
+def notification_actions(phrase):
+    return MONITOR.actions
+
+
+@ctx.dynamic_list("user.notification_apps")
+def notification_apps(phrase):
+    return MONITOR.apps
 
 
 @ctx.action_class("user")
@@ -159,9 +147,6 @@ class UserActions:
     def notification_show_actions(index: int):
         MONITOR.show_actions(index)
 
-    def notifications_update():
-        MONITOR.update_notifications()
-
     def notification_center():
         cc = ui.apps(bundle="com.apple.controlcenter")[0]
         cc.element.children.find_one(AXRole="AXMenuBar", max_depth=0).children.find_one(
@@ -174,12 +159,10 @@ class UserActions:
 
 @imgui.open()
 def gui_actions(gui: imgui.GUI):
-    global notification_actions
-
     gui.text("Notification actions")
     gui.text("Say “note <notification number> <action>”")
     gui.line()
-    for notification in notification_actions:
+    for notification in MONITOR.actions_for_notification:
         gui.text(notification)
     gui.spacer()
     if gui.button("Close (say “note actions”)"):
@@ -189,49 +172,59 @@ def gui_actions(gui: imgui.GUI):
 class NotificationMonitor:
     __slots__ = (
         "pid",
-        "notifications",
+        "actions_for_notification",
+        "_notifications",
+        "_actions",
+        "_apps",
     )
 
     def __init__(self, app: ui.App):
         self.pid = app.pid
-        self.notifications = []
 
         ui.register("win_open", self.win_open)
         ui.register("win_close", self.win_close)
         ui.register("app_close", self.app_closed)
 
-        self.update_notifications()
+        self.hide_actions()
 
     def win_open(self, window):
         if not window.app.pid == self.pid:
             return
 
-        notifications = Notification.notifications_in_window(window)
-        self.update_notifications(adding=notifications)
+        self.hide_actions()
 
-    def notification_groups(self):
+    def notification_buttons(self):
         ncui = ui.apps(pid=self.pid)[0]
         for window in ncui.windows():
-            for group in window.children.find(AXRole="AXGroup"):
-                if not (identifier := Notification.group_identifier(group)):
+            try:
+                button_list = window.children.find_one(AXSubrole="AXOpaqueProviderList")
+            except ui.UIErr:
+                continue
+
+            for child in button_list.children:
+                if getattr(child, "AXSubrole", None) not in (
+                    "AXNotificationCenterAlert",
+                    "AXNotificationCenterBanner",
+                    "AXNotificationCenterBannerStack",
+                ):
+                    continue
+                if not (identifier := Notification.identifier(child)):
                     continue
 
-                yield identifier, group
+                yield identifier, child
 
     def __getitem__(self, index):
-        if index < 0 or index > len(self.notifications) - 1:
+        notifications = self.notifications
+
+        if index < 0 or index > len(notifications) - 1:
             app.notify(f"Unable to locate notification #{index + 1}", "Try again?")
             return None
 
-        return self.notifications[index]
+        return notifications[index]
 
     def perform_action(
         self, action: str, index: Optional[int] = None, app_name: str = None
     ):
-        self.update_notifications()
-
-        cron.after("500ms", self.update_notifications)
-
         notification = None
         if index is not None:
             if (notification := self[index]) is None:
@@ -241,7 +234,7 @@ class NotificationMonitor:
             try:
                 notification = next(
                     notification
-                    for notification in self.notifications
+                    for notification in self._notifications
                     if notification.app_name == app_name
                 )
             except StopIteration:
@@ -250,7 +243,7 @@ class NotificationMonitor:
                 )
                 return False
 
-        for identifier, group in self.notification_groups():
+        for identifier, button in self.notification_buttons():
             if identifier != notification.identifier:
                 continue
 
@@ -262,33 +255,30 @@ class NotificationMonitor:
                     app.notify(f"No such action “{action}”", "Try again?")
                     return False
 
-            group.perform(notification.actions[action])
+            button.perform(notification.actions[action])
             return True
 
         app.notify("Unable to locate notification", "Try again?")
         return False
 
     def show_actions(self, index: int):
-        global notification_actions
-
-        if gui_actions.showing:
-            gui_actions.hide()
+        self.hide_actions()
 
         if index == -1:
             return
 
-        self.update_notifications()
-
         if (notification := self[index]) is None:
             return
 
-        for identifier, group in self.notification_groups():
+        for identifier, button in self.notification_buttons():
             if identifier != notification.identifier:
                 continue
 
-            notification_actions = set(notification.actions.keys())
+            # XXX(nriley) actions are returned out of (menu) order
+            # XXX(nriley) sorting them is better than nothing
+            self.actions_for_notification = sorted(notification.actions.keys())
 
-            frame = group.AXFrame
+            frame = button.AXFrame
             break
         else:
             return
@@ -297,41 +287,54 @@ class NotificationMonitor:
         gui_actions.y = frame.top
         gui_actions.show()
 
-    def update_notifications(self, adding=[]):
+    def hide_actions(self):
         if gui_actions.showing:
             gui_actions.hide()
 
-        if adding:
-            self.notifications += adding
+            del self.actions_for_notification
+
+    @property
+    def actions(self):
+        self.update()
+        return self._actions
+
+    @property
+    def apps(self):
+        self.update()
+        return self._apps
+
+    @property
+    def notifications(self):
+        self.update()
+        return self._notifications
+
+    def update(self):
+        if hasattr(self, "_actions"):
+            return
+
+        self.hide_actions()
 
         notifications = {}
-        for identifier, group in self.notification_groups():
-            y = group.AXPosition.y
+        for identifier, button in self.notification_buttons():
+            y = button.AXPosition.y
+            notifications[y] = Notification.from_button(button, identifier)
 
-            try:
-                notifications[y] = self.notifications[
-                    self.notifications.index(Notification(identifier=identifier))
-                ]
-            except ValueError:
-                notifications[y] = Notification.from_group(group, identifier)
-
-        # groups may be not be returned in order of increasing y
+        # notification buttons may be not be returned in order of increasing y
         notifications = dict(sorted(notifications.items()))
-
-        self.notifications = list(notifications.values())
         if notifications:
             debug_print("notifications", notifications)
+        self._notifications = notifications = list(notifications.values())
 
         notification_actions = set()
         notification_apps = set()
 
-        for notification in self.notifications:
+        for notification in notifications:
             notification_actions.update(notification.actions.keys())
             notification_apps.add(notification.app_name)
 
         notification_actions = list(notification_actions)
         # XXX(nriley) create_spoken_forms_from_list doesn't handle apostrophes correctly
-        # https://github.com/knausj85/knausj_talon/issues/780
+        # https://github.com/talonhub/community/issues/780
         apostrophe_words = {
             word.replace("'", " "): word
             for word in chain.from_iterable(
@@ -350,27 +353,38 @@ class NotificationMonitor:
                 for spoken_form, action in notification_actions.items()
                 if "apostrophe" not in spoken_form
             }
+        if "actions" in notification_actions:
+            # avoid conflict with "note [...] actions"
+            del notification_actions["actions"]
         if notification_actions:
             debug_print("actions", notification_actions)
 
         if "close" not in notification_actions and "clear all" in notification_actions:
             # allow closing a notification stack like an individual notification
             notification_actions["close"] = "clear all"
-        ctx.lists["user.notification_actions"] = notification_actions
+        self._actions = notification_actions
 
-        # XXX(nriley) use app name overrides from knausj?
+        # XXX(nriley) use app name overrides from community?
         notification_apps = actions.user.create_spoken_forms_from_list(
             notification_apps
         )
-        ctx.lists["user.notification_apps"] = notification_apps
         if notification_apps:
             debug_print("apps", notification_apps)
+        self._apps = notification_apps
+
+    def flush_notification_cache(self):
+        if not hasattr(self, "_actions"):
+            return
+
+        del self._apps
+        del self._actions
+        del self._notifications
 
     def win_close(self, window):
         if not window.app.pid == self.pid:
             return
 
-        self.update_notifications()
+        self.hide_actions()
 
     def app_closed(self, app):
         if app.pid == self.pid:
@@ -386,7 +400,12 @@ def app_launched(app):
     MONITOR = NotificationMonitor(app)
 
 
-def monitor():
+def post_phrase(_):
+    if MONITOR:
+        MONITOR.flush_notification_cache()
+
+
+def on_ready():
     global MONITOR
 
     apps = ui.apps(bundle="com.apple.notificationcenterui")
@@ -395,5 +414,7 @@ def monitor():
 
     ui.register("app_launch", app_launched)
 
+    speech_system.register("post:phrase", post_phrase)
 
-app.register("ready", monitor)
+
+app.register("ready", on_ready)
